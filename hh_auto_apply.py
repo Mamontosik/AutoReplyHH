@@ -1,17 +1,18 @@
 import time
 import random
 import sys
+import requests
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+
 
 def close_response_modal(page) -> bool:
     """Закрывает любое всплывающее модальное окно hh.ru"""
     closed = False
     try:
-        # Основные селекторы hh.ru для модалок отклика
         close_selectors = [
-            '[data-qa="response-popup-close"]',      # самый частый
+            '[data-qa="response-popup-close"]',
             '[data-qa="modal-close"]',
             'button[aria-label*="Закрыть"]',
             '.bloko-modal-close',
@@ -29,73 +30,126 @@ def close_response_modal(page) -> bool:
                 closed = True
                 break
 
-        # Дополнительно скрываем сам диалог, если он остался
         if page.locator('[role="dialog"]').is_visible(timeout=1000):
             page.locator('[role="dialog"]').first.evaluate("el => el.style.display = 'none'")
             closed = True
-
     except:
         pass
     return closed
 
 
+def handle_vacancy_form(page):
+    """Обрабатывает форму отклика через n8n + Ollama"""
+    try:
+        page.wait_for_selector('div[role="dialog"], .vacancy-response-modal, [data-qa*="response"], form', timeout=8000)
+        print("✅ Обнаружена форма отклика — отправляем в n8n...")
+
+        fields = page.locator('textarea, input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select').all()
+        
+        questions = []
+        for i, field in enumerate(fields):
+            label = field.locator('..').inner_text().strip() if field.locator('..').count() else ""
+            placeholder = field.get_attribute("placeholder") or ""
+            question_text = label or placeholder or f"Поле {i+1}"
+            
+            questions.append({
+                "label": question_text[:300],
+                "type": field.get_attribute("type") or "text",
+                "index": i
+            })
+
+        if not questions:
+            print("⚠️ Форма найдена, но полей не обнаружено")
+            return False
+
+        print(f"Найдено {len(questions)} полей в форме")
+
+        # Отправка в n8n
+        payload = {
+            "questions": questions,
+            "vacancy_title": page.title() or "Вакансия"
+        }
+
+        response = requests.post(
+            "http://localhost:5678/webhook/hh-form-reply",
+            json=payload,
+            timeout=40
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        answers = data.get("answers", [])
+
+        if len(answers) != len(questions):
+            print(f"❌ Количество ответов не совпадает: {len(answers)} вместо {len(questions)}")
+            return False
+
+        # Заполняем поля
+        for i, answer in enumerate(answers):
+            if i >= len(fields):
+                break
+            field = fields[i]
+            try:
+                field.fill(str(answer)[:800])
+                print(f"   Заполнено поле {i+1}: {answer[:50]}...")
+            except:
+                pass
+
+        # Нажимаем "Отправить"
+        submit_btn = page.locator('button:has-text("Откликнуться"), button:has-text("Отправить"), button[data-qa*="submit"]').first
+        if submit_btn.count() > 0:
+            submit_btn.click()
+            print("✅ Форма отправлена через AI!")
+            page.wait_for_timeout(1500)
+            return True
+        else:
+            print("⚠️ Кнопка отправки не найдена")
+            return False
+
+    except Exception as e:
+        print(f"Ошибка при обработке формы: {e}")
+        return False
+
+
 def main():
     print("=" * 80)
-    print("🚀 HH.ru Автоотклики — Playwright (исправленная версия)")
+    print("🚀 HH.ru Автоотклики — Playwright + n8n AI")
     print(f"🐍 Python: {sys.executable}")
     print(f"📁 Папка: {Path.cwd()}")
     print("=" * 80)
 
     with sync_playwright() as p:
-        # === ВЫБОР БРАУЗЕРА ===
         choice = input("\nВыберите браузер (1 — Chromium, 2 — WebKit): ").strip()
         if choice == "2":
             browser = p.webkit.launch(headless=False, slow_mo=80)
-            print("✅ WebKit (нативный для M1/M2/M3/M4)")
+            print("✅ WebKit (нативный для M1)")
         else:
-            browser = p.chromium.launch(
-                headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-extensions",
-                    "--disable-infobars",
-                    "--disable-dev-shm-usage",
-                    "--start-maximized",
-                ]
-            )
-            print("✅ Chromium")
+            browser = p.chromium.launch(headless=False, args=["--disable-blink-features=AutomationControlled"])
 
         context = browser.new_context(
             viewport={"width": 1440, "height": 900},
-            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36",
+            user_agent="Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36",
             locale="ru-RU",
             timezone_id="Europe/Moscow",
         )
         page = context.new_page()
 
-        # === ОБРАБОТКА ВСПЛЫВАЮЩИХ ОКОН И ДИАЛОГОВ ===
+        # Обработка всплывающих окон
         skipped_popup = 0
-
         def handle_new_page(new_page):
             nonlocal skipped_popup
-            print(f"🔴 Новая вкладка открыта → закрываем ({new_page.url})")
+            print(f"🔴 Новая вкладка → закрываем")
             try:
                 new_page.close()
                 skipped_popup += 1
-                # Возвращаем фокус на главную страницу
                 context.pages[0].bring_to_front()
             except:
                 pass
 
-        def handle_dialog(dialog):
-            print(f"🛑 JS-диалог: {dialog.message} → закрываем")
-            dialog.dismiss()
-
         context.on("page", handle_new_page)
-        context.on("dialog", handle_dialog)
+        context.on("dialog", lambda dialog: dialog.dismiss())
 
-        # === СЧЁТЧИКИ ===
+        # Счётчики
         total_applied = 0
         skipped_redirect = 0
         errors = 0
@@ -104,15 +158,14 @@ def main():
 
         page.goto("https://hh.ru/", wait_until="domcontentloaded", timeout=60000)
 
-        print("\n✅ Браузер открыт.")
+        print("\n✅ Браузер готов.")
         print("👉 Залогинься и настрой фильтры.")
-        input("Когда будешь готов — нажми Enter...")
+        input("Когда готов — нажми Enter...")
 
         print("\n🚀 Запускаем автоотклики...\n")
 
         while page_number <= max_pages:
             print(f"📄 Страница {page_number}")
-
             page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
             page.wait_for_timeout(random.randint(1500, 2500))
 
@@ -135,23 +188,28 @@ def main():
 
                     current_url = page.url
 
-                    # === КЛИК ===
+                    # === КЛИК ПО КНОПКЕ «ОТКЛИКНУТЬСЯ» ===
                     btn.click(timeout=10000)
                     page.wait_for_timeout(random.randint(2200, 3800))
 
-                    # === ЗАКРЫВАЕМ МОДАЛКУ (главное исправление) ===
+                    # === AI-ОБРАБОТКА ФОРМЫ ===
+                    form_processed = handle_vacancy_form(page)
+
+                    if form_processed:
+                        total_applied += 1
+                        print(f"   ✅ Отклик отправлен через AI! (Всего: {total_applied})")
+                        continue
+
+                    # === СТАРАЯ ЛОГИКА (если формы не было) ===
                     modal_closed = close_response_modal(page)
 
-                    # === ПРОВЕРКА РЕДИРЕКТА ===
                     if page.url != current_url:
-                        print("   🔄 Произошёл редирект → возвращаемся назад")
+                        print("   🔄 Редирект → возвращаемся")
                         skipped_redirect += 1
                         try:
                             page.go_back(wait_until="domcontentloaded", timeout=15000)
                             page.wait_for_timeout(1200)
-                            close_response_modal(page)  # на всякий случай
                         except:
-                            # Если go_back не сработал — просто обновляем текущую страницу
                             page.reload(wait_until="domcontentloaded", timeout=15000)
                     elif modal_closed:
                         print("   ✅ Модалка закрыта — вакансия пропущена")
@@ -166,7 +224,7 @@ def main():
                     print(f"   ❌ Ошибка: {type(e).__name__}")
                     continue
 
-            # === СЛЕДУЮЩАЯ СТРАНИЦА ===
+            # Следующая страница
             try:
                 next_btn = page.locator('a[data-qa="pager-next"], button:has-text("Дальше")').first
                 if next_btn.is_visible() and not next_btn.get_attribute("disabled"):
@@ -180,7 +238,7 @@ def main():
             except:
                 break
 
-        # === ОТЧЁТ ===
+        # === ФИНАЛЬНЫЙ ОТЧЁТ ===
         print("\n" + "="*80)
         print("🎉 РАБОТА ЗАВЕРШЕНА")
         print("="*80)
