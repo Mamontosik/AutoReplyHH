@@ -37,79 +37,99 @@ def close_response_modal(page) -> bool:
         pass
     return closed
 
-
 def handle_vacancy_form(page):
-    """Обрабатывает форму отклика через n8n + Ollama"""
+    """Обрабатывает форму отклика через n8n + Ollama (финальная версия)"""
     try:
-        page.wait_for_selector('div[role="dialog"], .vacancy-response-modal, [data-qa*="response"], form', timeout=8000)
+        page.wait_for_selector('div[role="dialog"], .vacancy-response-modal, [data-qa*="response"]', timeout=12000)
         print("✅ Обнаружена форма отклика — отправляем в n8n...")
 
-        fields = page.locator('textarea, input:not([type="hidden"]):not([type="submit"]):not([type="button"]), select').all()
-        
+        # Только текстовые поля (исключаем radio, checkbox, select, hidden)
+        fields = page.locator(
+            'textarea, input[type="text"], input[type="email"], input[type="tel"], input:not([type])'
+        ).all()
+
         questions = []
         for i, field in enumerate(fields):
-            label = field.locator('..').inner_text().strip() if field.locator('..').count() else ""
+            if not field.is_visible(timeout=500):
+                continue
+
+            label = field.locator('xpath=preceding::label[1] | ..//label | ..//span[contains(@class,"bloko-form-label")]').first.inner_text().strip() or ""
             placeholder = field.get_attribute("placeholder") or ""
             question_text = label or placeholder or f"Поле {i+1}"
-            
+
+            if len(question_text.strip()) < 3:
+                continue
+
             questions.append({
-                "label": question_text[:300],
+                "label": question_text[:400],
                 "type": field.get_attribute("type") or "text",
                 "index": i
             })
 
-        if not questions:
-            print("⚠️ Форма найдена, но полей не обнаружено")
+        if len(questions) < 2:
+            print(f"⚠️ Мало реальных полей ({len(questions)}) — пропускаем AI")
             return False
 
-        print(f"Найдено {len(questions)} полей в форме")
+        print(f"Найдено {len(questions)} реальных текстовых полей для AI")
 
-        # Отправка в n8n
         payload = {
             "questions": questions,
-            "vacancy_title": page.title() or "Вакансия"
+            "vacancy_title": page.title() or "Вакансия на HH"
         }
 
+        print("   📤 Запрос в n8n (максимум 3 минуты)...")
         response = requests.post(
             "http://localhost:5678/webhook/hh-form-reply",
             json=payload,
-            timeout=40
+            timeout=180
         )
         response.raise_for_status()
-        
+
         data = response.json()
         answers = data.get("answers", [])
 
-        if len(answers) != len(questions):
-            print(f"❌ Количество ответов не совпадает: {len(answers)} вместо {len(questions)}")
+        print(f"   📥 AI вернул {len(answers)} ответов")
+
+        if len(answers) == 0 or answers == ["не указано"]:
+            print("   ⚠️ AI вернул пустой или бесполезный ответ")
             return False
 
-        # Заполняем поля
+        # Заполняем только текстовые поля
         for i, answer in enumerate(answers):
-            if i >= len(fields):
-                break
-            field = fields[i]
+            if i >= len(fields) or not str(answer).strip():
+                continue
             try:
+                field = fields[i]
                 field.fill(str(answer)[:800])
-                print(f"   Заполнено поле {i+1}: {answer[:50]}...")
-            except:
-                pass
+                print(f"   ✅ Заполнено поле {i+1}: {str(answer)[:70]}...")
+            except Exception as e:
+                print(f"   ⚠️ Не удалось заполнить поле {i+1}: {e}")
 
-        # Нажимаем "Отправить"
-        submit_btn = page.locator('button:has-text("Откликнуться"), button:has-text("Отправить"), button[data-qa*="submit"]').first
-        if submit_btn.count() > 0:
-            submit_btn.click()
-            print("✅ Форма отправлена через AI!")
-            page.wait_for_timeout(1500)
-            return True
-        else:
-            print("⚠️ Кнопка отправки не найдена")
+        # Ждём, пока кнопка станет активной
+        submit_btn = page.locator('button:has-text("Откликнуться"), button:has-text("Отправить"), [data-qa*="submit"]').first
+        submit_btn.wait_for(state="visible", timeout=15000)
+        
+        # Если кнопка disabled — ждём до 10 секунд
+        for _ in range(20):
+            if not submit_btn.get_attribute("disabled"):
+                break
+            page.wait_for_timeout(500)
+
+        if submit_btn.get_attribute("disabled"):
+            print("⚠️ Кнопка отправки всё ещё disabled")
             return False
 
-    except Exception as e:
-        print(f"Ошибка при обработке формы: {e}")
-        return False
+        submit_btn.click()
+        print("✅ Форма отправлена через AI!")
+        page.wait_for_timeout(2000)
+        return True
 
+    except requests.exceptions.Timeout:
+        print("❌ Таймаут n8n (Ollama думает слишком долго)")
+        return False
+    except Exception as e:
+        print(f"❌ Ошибка при обработке формы: {e}")
+        return False
 
 def main():
     print("=" * 80)
